@@ -1,0 +1,238 @@
+name: build-catbox-apk
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      # 源码在**私有**仓库 France113/catbox-flutter，通过 Secret 里的 PAT 拉取。
+      # 本仓库(public)只承载构建流程，不含任何业务代码。
+      - uses: actions/checkout@v4
+        with:
+          repository: France113/catbox-flutter
+          token: ${{ secrets.PAT_PRIVATE }}
+          persist-credentials: false
+
+      # ---------- 工具链 ----------
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: |
+            platforms;android-36
+            build-tools;36.0.0
+            ndk;27.0.12077973
+            cmake;3.22.1
+          accept-android-sdk-license: true
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Versions
+        run: |
+          flutter --version
+          node -v
+          java -version 2>&1 | head -1
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          ls "$ANDROID_HOME/ndk" 2>/dev/null || true
+          ls "$ANDROID_HOME/build-tools" 2>/dev/null || true
+
+      # ---------- 1) 打包 Node sidecar（fastify → 单文件） ----------
+      - name: Build JS sidecar (esbuild)
+        run: |
+          set -uo pipefail
+          cd js
+          npm install --no-audit --no-fund
+          npm run build
+          ls -lh ../assets/js/index.js
+          node --check ../assets/js/index.js
+
+      # ---------- 2) libnode.so（nodejs-mobile v18.20.4，per ABI） ----------
+      - name: Fetch libnode.so (per ABI)
+        run: |
+          # 刻意不开 -e：每步自己判错（pipefail + API 限流会静默退出，踩过）
+          set -uo pipefail
+          URL="https://github.com/nodejs-mobile/nodejs-mobile/releases/download/v18.20.4/nodejs-mobile-v18.20.4-android.zip"
+          echo "download: $URL"
+          ok=0
+          for i in 1 2 3; do
+            echo "attempt $i"
+            if curl -fL --retry 3 --retry-delay 3 --connect-timeout 30 --max-time 900 \
+                 -o /tmp/node-android.zip "$URL"; then
+              ok=1; break
+            fi
+            echo "attempt $i failed, retrying in 5s"
+            sleep 5
+          done
+          if [ "$ok" != "1" ]; then echo "::error::nodejs-mobile 下载失败（3 次）"; exit 1; fi
+
+          ls -lh /tmp/node-android.zip
+          rm -rf /tmp/nm && mkdir -p /tmp/nm
+          unzip -q -o /tmp/node-android.zip -d /tmp/nm || { echo "::error::解压失败"; exit 1; }
+          for ABI in arm64-v8a armeabi-v7a x86_64; do
+            SRC="/tmp/nm/bin/$ABI/libnode.so"
+            DST="android/app/src/main/jniLibs/$ABI"
+            if [ ! -f "$SRC" ]; then echo "::error::缺少 $SRC"; exit 1; fi
+            mkdir -p "$DST"
+            cp "$SRC" "$DST/libnode.so"
+            echo "$ABI: $(stat -c%s "$DST/libnode.so") bytes"
+          done
+
+      # ---------- 3) strip 瘦身 + 16KB 页重对齐（Android 15+） ----------
+      - name: Strip + 16KB page-align libnode.so
+        run: |
+          set -uo pipefail
+          STRIP=$(ls -d "$ANDROID_HOME"/ndk/27.0.12077973/toolchains/llvm/prebuilt/*/bin/llvm-strip | head -1)
+          if [ -z "$STRIP" ] || [ ! -x "$STRIP" ]; then echo "::error::llvm-strip not found"; exit 1; fi
+          for ABI in arm64-v8a armeabi-v7a x86_64; do
+            F="android/app/src/main/jniLibs/$ABI/libnode.so"
+            echo "== $ABI before strip: $(stat -c%s "$F") bytes"
+            "$STRIP" --strip-unneeded "$F"
+            echo "== $ABI after  strip: $(stat -c%s "$F") bytes"
+          done
+          # 4KB → 16KB 重布局（patchelf --page-size 做不到，自研脚本，自带校验+幂等）
+          python3 scripts/align_elf_16k.py android/app/src/main/jniLibs/*/libnode.so || {
+            echo "::error::16KB 重对齐失败"; exit 1; }
+          python3 scripts/check_elf_16k.py android/app/src/main/jniLibs/*/libnode.so || {
+            echo "::error::16KB 校验失败"; exit 1; }
+
+      # ---------- 4) 用官方模板补齐 Android 宿主（gradlew / wrapper jar / 官方 settings） ----------
+      - name: Assemble Android host
+        run: |
+          set -euo pipefail
+          flutter create --platforms=android --org com.catbox --project-name catbox /tmp/host
+          mkdir -p /tmp/keep
+          # 我们的自定义文件
+          cp -r android/app/src/main/kotlin /tmp/keep/kotlin
+          cp -r android/app/src/main/cpp   /tmp/keep/cpp
+          cp -r android/app/src/main/res   /tmp/keep/res
+          cp android/app/src/main/AndroidManifest.xml /tmp/keep/AndroidManifest.xml
+          cp android/app/build.gradle       /tmp/keep/app-build.gradle
+          cp android/app/proguard-rules.pro /tmp/keep/proguard-rules.pro
+          # 模板带来：settings.gradle(.kts) + 根 build.gradle + gradle.properties + wrapper(jar/脚本)
+          rsync -a /tmp/host/android/ android/
+          # 只保留模板生成的那种 DSL，删掉仓库里的另一种，避免歧义
+          if [ -f android/settings.gradle.kts ]; then rm -f android/settings.gradle; fi
+          if [ -f android/build.gradle.kts ];   then rm -f android/build.gradle;   fi
+          # 恢复自定义文件
+          rm -rf android/app/src/main/kotlin android/app/src/main/cpp android/app/src/main/res
+          cp -r /tmp/keep/kotlin android/app/src/main/kotlin
+          cp -r /tmp/keep/cpp   android/app/src/main/cpp
+          cp -r /tmp/keep/res   android/app/src/main/res
+          cp /tmp/keep/AndroidManifest.xml android/app/src/main/AndroidManifest.xml
+          cp /tmp/keep/app-build.gradle     android/app/build.gradle
+          cp /tmp/keep/proguard-rules.pro   android/app/proguard-rules.pro
+          echo "--- android/ ---"; ls android android/app
+          echo "--- settings ---"; cat android/settings.gradle* 2>/dev/null
+          echo "--- wrapper ---"; ls android/gradle/wrapper/ android/gradlew
+
+      # ---------- 5) 依赖解析 ----------
+      - name: Flutter pub get
+        run: |
+          set -o pipefail
+          flutter pub get 2>&1 | tee -a /tmp/build.log || {
+            echo "==================== PUB GET FAILED ====================" | tee -a /tmp/build.log
+            flutter pub get -v 2>&1 | tail -120 | tee -a /tmp/build.log
+            exit 1
+          }
+          echo "--- pubspec.lock 关键包 ---" | tee -a /tmp/build.log
+          grep -B1 -A3 -E '^  (fvp|video_player|media3|http|shared_preferences|path_provider|file_picker):' pubspec.lock | tee -a /tmp/build.log || true
+
+      # ---------- 6) 一次性 keystore（侧载安装用；无则回退 debug 签名） ----------
+      - name: Generate keystore
+        run: |
+          set -euo pipefail
+          keytool -genkeypair -v -keystore /tmp/catbox.keystore -alias catbox \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass catbox123 -keypass catbox123 \
+            -dname "CN=CatBox, OU=Mobile, O=CatBox, L=Shenzhen, S=Guangdong, C=CN" 2>&1 | tail -3
+          {
+            echo "storeFile=/tmp/catbox.keystore"
+            echo "storePassword=catbox123"
+            echo "keyAlias=catbox"
+            echo "keyPassword=catbox123"
+          } > android/keystore.properties
+          cat android/keystore.properties
+
+      # ---------- 7) 构建 ----------
+      - name: Build APKs (split per ABI)
+        run: |
+          set +e
+          flutter build apk --release --split-per-abi -v > /tmp/build.log 2>&1
+          rc=$?
+          echo "flutter build rc=$rc"
+          if [ $rc -ne 0 ]; then
+            echo "===== 关键错误 ====="
+            grep -nE "error:|FAILURE|What went wrong|Caused by|> Task .* FAILED|e: file" /tmp/build.log | tail -40
+            echo "===== 失败任务上下文 ====="
+            LN=$(grep -n "FAILURE:" /tmp/build.log | head -1 | cut -d: -f1)
+            if [ -n "${LN:-}" ]; then
+              START=$((LN-100)); [ "$START" -lt 1 ] && START=1
+              sed -n "${START},$((LN+40))p" /tmp/build.log | grep -vE "^\s*$" | tail -140
+            fi
+            echo "===== 最后 30 行 ====="
+            tail -30 /tmp/build.log
+            exit 1
+          fi
+          tail -20 /tmp/build.log
+          ls -lh build/app/outputs/flutter-apk/
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-build-log
+          path: /tmp/build.log
+          retention-days: 7
+
+      # ---------- 8) 校验：签名 / zipalign / 16KB ----------
+      - name: Verify APKs
+        run: |
+          set -uo pipefail
+          BT="$ANDROID_HOME/build-tools/36.0.0"
+          for APK in build/app/outputs/flutter-apk/*.apk; do
+            echo "===== $APK ($(stat -c%s "$APK") bytes) ====="
+            "$BT/aapt2" dump badging "$APK" 2>/dev/null | grep -E "^package|sdkVersion|targetSdkVersion|application-label:" || true
+            "$BT/apksigner" verify --print-certs "$APK" 2>&1 | head -4
+            "$BT/zipalign" -c -v 4 "$APK" 2>&1 | tail -2
+            # 16KB：解出所有 .so 跑 ELF 校验 + 打印 APK 内偏移
+            rm -rf /tmp/verify && mkdir -p /tmp/verify
+            unzip -qo "$APK" 'lib/*' -d /tmp/verify
+            echo "--- .so 清单（APK 内偏移 / 大小）---"
+            unzip -v "$APK" | grep -E "\.so$" || true
+            python3 scripts/check_elf_16k.py $(find /tmp/verify/lib -name '*.so' | sort) \
+              || echo "::warning::$APK 存在非 16KB 对齐 .so（Android <=14 不受影响，Android 15+ 16KB 页设备装不了）"
+          done
+
+      # ---------- 9) 交付物 ----------
+      - name: Package artifacts
+        run: |
+          set -euo pipefail
+          rm -rf out && mkdir -p out
+          for APK in build/app/outputs/flutter-apk/*.apk; do
+            ABI=$(basename "$APK" .apk | sed 's/^app-//; s/-release$//')
+            cp "$APK" "out/catbox-$ABI.apk"
+          done
+          ls -lh out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: catbox-android-apk
+          path: out/*.apk
+          retention-days: 14
