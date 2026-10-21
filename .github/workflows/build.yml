@@ -1,0 +1,199 @@
+name: build-catbox-ipa
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    # 2026-10-21 排查记录：macos-15 / macos-14 都出现 job 1~2 秒失败、steps=0、runner_name 为空
+    # → 不是 runner 池子容量问题，是账户 Actions 额度耗尽（私有仓库 macOS 按 10 倍计费）。
+    # 恢复途径：① 仓库转 public（Actions 免费无限）② 等额度重置。
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      # 源码在**私有**仓库 France113/catbox-flutter，这里通过 Secret 里的 PAT 拉取。
+      # 本仓库(public)只承载构建流程，不含任何业务代码。
+      - uses: actions/checkout@v4
+        with:
+          repository: France113/catbox-flutter
+          token: ${{ secrets.PAT_PRIVATE }}
+          persist-credentials: false
+
+      # ---------- 工具链 ----------
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Versions
+        run: |
+          flutter --version
+          node -v
+          xcodebuild -version
+          pod --version
+
+      # ---------- 1) 打包 Node sidecar（fastify → 单文件） ----------
+      - name: Build JS sidecar (esbuild)
+        run: |
+          cd js
+          npm install --no-audit --no-fund
+          npm run build
+          ls -lh ../assets/js/index.js
+          node --check ../assets/js/index.js
+
+      # ---------- 2) NodeMobile.xcframework（缓存优先，直链下载） ----------
+      - name: Cache NodeMobile.xcframework
+        id: nm-cache
+        uses: actions/cache@v4
+        with:
+          path: ios/CatNode/Frameworks/NodeMobile.xcframework
+          key: nodemobile-xcframework-v18.20.4-v2
+
+      - name: Fetch NodeMobile.xcframework
+        if: steps.nm-cache.outputs.cache-hit != 'true'
+        run: |
+          # 刻意不开 -e：每一步自己判错并给出可读信息，
+          # 否则 pipefail + API 限流会让整个 step 静默退出（踩过两次）
+          set -uo pipefail
+          mkdir -p ios/CatNode/Frameworks
+
+          # 直链固定版本，不依赖 API（未认证 API 60 次/小时，runner IP 共享会被限流）
+          URL="https://github.com/nodejs-mobile/nodejs-mobile/releases/download/v18.20.4/nodejs-mobile-v18.20.4-ios.zip"
+          echo "download: $URL"
+
+          ok=0
+          for i in 1 2 3; do
+            echo "attempt $i"
+            if curl -fL --retry 3 --retry-delay 3 --connect-timeout 30 --max-time 600 \
+                 -o /tmp/node.zip "$URL"; then
+              ok=1; break
+            fi
+            echo "attempt $i failed, retrying in 5s"
+            sleep 5
+          done
+          if [ "$ok" != "1" ]; then echo "::error::NodeMobile 下载失败（3 次）"; exit 1; fi
+
+          ls -lh /tmp/node.zip
+          rm -rf /tmp/node && mkdir -p /tmp/node
+          unzip -q -o /tmp/node.zip -d /tmp/node || { echo "::error::解压失败"; exit 1; }
+          find /tmp/node -maxdepth 2 -name "*.xcframework" -o -maxdepth 2 -name "*.framework" -type d
+
+          XCF=$(find /tmp/node -maxdepth 3 -name "NodeMobile.xcframework" -type d | head -1)
+          rm -rf ios/CatNode/Frameworks/NodeMobile.xcframework ios/CatNode/Frameworks/NodeMobile.framework
+          if [ -z "${XCF:-}" ]; then
+            echo "::error::未找到 NodeMobile.xcframework"; exit 1
+          fi
+          echo "xcframework: $XCF"
+          cp -R "$XCF" ios/CatNode/Frameworks/
+          test -d ios/CatNode/Frameworks/NodeMobile.xcframework/ios-arm64 || {
+            echo "::error::xcframework 缺少 ios-arm64 设备切片"; exit 1; }
+          ls ios/CatNode/Frameworks/NodeMobile.xcframework
+
+      - name: Verify NodeMobile slice
+        run: |
+          set -uo pipefail
+          D=ios/CatNode/Frameworks/NodeMobile.xcframework/ios-arm64/NodeMobile.framework
+          ls -la "$D"
+          file "$D/NodeMobile"
+          if ! file "$D/NodeMobile" | grep -q arm64; then
+            echo "::error::NodeMobile 不是 arm64 设备切片"; exit 1
+          fi
+
+      # ---------- 3) 生成 Flutter iOS 宿主，再用仓库里的模板覆盖 ----------
+      - name: Assemble iOS host
+        run: |
+          set -euo pipefail
+          flutter create --platforms=ios --org com.catbox --project-name catbox /tmp/host
+          # 备份我们自己的宿主文件
+          mkdir -p /tmp/keep
+          cp ios/Runner/AppDelegate.swift /tmp/keep/
+          cp ios/Runner/Info.plist /tmp/keep/
+          cp ios/Podfile /tmp/keep/
+          # 用模板补齐 Runner.xcodeproj / storyboard / xcassets 等
+          rsync -a /tmp/host/ios/ ios/
+          # 覆盖回我们的版本
+          cp /tmp/keep/AppDelegate.swift ios/Runner/AppDelegate.swift
+          cp /tmp/keep/Info.plist ios/Runner/Info.plist
+          cp /tmp/keep/Podfile ios/Podfile
+          # CatNode 目录不受 rsync 影响，确认还在
+          ls -la ios/CatNode/Classes ios/CatNode/Frameworks
+          ls ios/Runner | head -20
+
+      # ---------- 4) 依赖 + 构建 ----------
+      - name: Flutter pub get
+        run: |
+          # 失败时把完整解析日志写进 build.log，否则失败的 job 日志经常取不到
+          set -o pipefail
+          flutter pub get 2>&1 | tee -a /tmp/build.log || {
+            echo "==================== PUB GET FAILED ====================" | tee -a /tmp/build.log
+            flutter pub get -v 2>&1 | tail -120 | tee -a /tmp/build.log
+            exit 1
+          }
+          echo "--- pubspec.lock 关键包 ---" | tee -a /tmp/build.log
+          grep -A2 -E '^  (fvp|video_player|video_player_platform_interface|plugin_platform_interface):' pubspec.lock | tee -a /tmp/build.log || true
+
+      - name: Pod install
+        run: |
+          set -euo pipefail
+          cd ios
+          pod install --repo-update
+          ls -la
+
+      - name: Build (unsigned)
+        run: |
+          set +e
+          flutter build ios --release --no-codesign -v > /tmp/build.log 2>&1
+          rc=$?
+          echo "flutter build rc=$rc"
+          if [ $rc -ne 0 ]; then
+            echo "===== 关键错误 ====="
+            grep -nE "error:|Undefined symbol|framework not found|PhaseScriptExecution failed" /tmp/build.log | tail -20
+            echo "===== 失败脚本上下文（前 150 行）====="
+            LN=$(grep -n "PhaseScriptExecution failed" /tmp/build.log | head -1 | cut -d: -f1)
+            if [ -n "${LN:-}" ]; then
+              START=$((LN-150)); [ "$START" -lt 1 ] && START=1
+              sed -n "${START},$((LN+3))p" /tmp/build.log | grep -vE "^\s*$" | tail -150
+            fi
+            echo "===== 最后 25 行 ====="
+            tail -25 /tmp/build.log
+            exit 1
+          fi
+          tail -20 /tmp/build.log
+          ls -la build/ios/iphoneos/
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: /tmp/build.log
+          retention-days: 7
+
+      # ---------- 5) 打包 IPA ----------
+      - name: Package IPA
+        run: |
+          set -euo pipefail
+          APP="build/ios/iphoneos/Runner.app"
+          test -d "$APP"
+          rm -rf /tmp/payload && mkdir -p /tmp/payload/Payload
+          cp -R "$APP" /tmp/payload/Payload/
+          cd /tmp/payload
+          zip -qry "$GITHUB_WORKSPACE/catbox-flutter-unsigned.ipa" Payload
+          cd "$GITHUB_WORKSPACE"
+          ls -lh catbox-flutter-unsigned.ipa
+          unzip -l catbox-flutter-unsigned.ipa | head -20
+          # 关键校验：NodeMobile 与 JS bundle 是否真的在包里
+          unzip -p catbox-flutter-unsigned.ipa "Payload/Runner.app/Frameworks/NodeMobile.framework/NodeMobile" > /tmp/nm 2>/dev/null && echo "NodeMobile in ipa: $(stat -f%z /tmp/nm) bytes" || echo "WARN: NodeMobile 未嵌入"
+          unzip -p catbox-flutter-unsigned.ipa "Payload/Runner.app/Frameworks/App.framework/flutter_assets/assets/js/index.js" > /tmp/js 2>/dev/null && echo "sidecar in ipa: $(stat -f%z /tmp/js) bytes" || echo "WARN: js sidecar 未打包"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: catbox-flutter-ipa
+          path: catbox-flutter-unsigned.ipa
+          retention-days: 14
