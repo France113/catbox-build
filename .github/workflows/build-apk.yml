@@ -201,6 +201,20 @@ jobs:
           path: /tmp/build.log
           retention-days: 7
 
+      # ---------- 7.5) 强制 v1+v2+v3 签名（AGP 9 默认不产 v1，老机器装不了） ----------
+      - name: Force v1+v2+v3 signature
+        run: |
+          set -euo pipefail
+          BT="$ANDROID_HOME/build-tools/36.0.0"
+          for APK in build/app/outputs/flutter-apk/*.apk; do
+            echo "re-signing $(basename "$APK")"
+            "$BT/apksigner" sign \
+              --ks /tmp/catbox.keystore --ks-key-alias catbox \
+              --ks-pass pass:catbox123 --key-pass pass:catbox123 \
+              --v1-signing-enabled true --v2-signing-enabled true --v3-signing-enabled true \
+              "$APK"
+          done
+
       # ---------- 8) 校验：签名 / zipalign / 16KB ----------
       - name: Verify APKs
         run: |
@@ -209,7 +223,14 @@ jobs:
           for APK in build/app/outputs/flutter-apk/*.apk; do
             echo "===== $APK ($(stat -c%s "$APK") bytes) ====="
             "$BT/aapt2" dump badging "$APK" 2>/dev/null | grep -E "^package|sdkVersion|targetSdkVersion|application-label:" || true
-            "$BT/apksigner" verify --print-certs "$APK" 2>&1 | head -4
+            "$BT/apksigner" verify --print-certs --verbose "$APK" 2>&1 | grep -E "Verifies|verified|number of signers" | head -4
+            # v1(JAR) 签名必须存在：Android 5.x/6.x 只认它
+            if unzip -l "$APK" | grep -qE "META-INF/.*\.(SF|RSA)"; then
+              echo "v1 signature: PRESENT"
+            else
+              echo "::error::v1(JAR) 签名缺失 —— Android 5.x/6.x 将无法安装"
+              exit 1
+            fi
             "$BT/zipalign" -c -v 4 "$APK" 2>&1 | tail -2
             # 16KB：解出所有 .so 跑 ELF 校验 + 打印 APK 内偏移
             rm -rf /tmp/verify && mkdir -p /tmp/verify
