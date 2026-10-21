@@ -26,12 +26,10 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
         with:
-          packages: |
-            platforms;android-36
-            build-tools;36.0.0
-            ndk;27.0.12077973
-            cmake;3.22.1
+          # 注意：单行空格分隔，不能用 YAML 多行块（整块会被当成一个包名）
+          packages: 'platforms;android-36 build-tools;36.0.0 ndk;27.0.12077973 cmake;3.22.1'
           accept-android-sdk-licenses: true
+          log-accepted-android-sdk-licenses: true
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
