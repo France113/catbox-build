@@ -136,6 +136,8 @@ jobs:
           cp /tmp/keep/AndroidManifest.xml android/app/src/main/AndroidManifest.xml
           cp /tmp/keep/app-build.gradle     android/app/build.gradle
           cp /tmp/keep/proguard-rules.pro   android/app/proguard-rules.pro
+          # app 目录只保留我们的 Groovy build.gradle，删掉模板的 .kts（否则 Gradle 报警告）
+          rm -f android/app/build.gradle.kts
           echo "--- android/ ---"; ls android android/app
           echo "--- settings ---"; cat android/settings.gradle* 2>/dev/null
           echo "--- wrapper ---"; ls android/gradle/wrapper/ android/gradlew
