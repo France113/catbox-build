@@ -175,6 +175,8 @@ jobs:
         run: |
           set +e
           flutter build apk --release --split-per-abi --build-number=${{ github.run_number }} --build-name="1.0.${{ github.run_number }}" -v > /tmp/build.log 2>&1
+        env:/n          CATBOX_RUN_NUMBER: ${{ github.run_number }}
+
           rc=$?
           echo "flutter build rc=$rc"
           if [ $rc -ne 0 ]; then
