@@ -9,6 +9,7 @@ jobs:
     timeout-minutes: 90
     env:
       CATBOX_RUN_NUMBER: ${{ github.run_number }}
+      ORG_GRADLE_PROJECT_catboxRunNumber: ${{ github.run_number }}
     steps:
       # 源码在**私有**仓库 France113/catbox-flutter，通过 Secret 里的 PAT 拉取。
       # 本仓库(public)只承载构建流程，不含任何业务代码。
@@ -176,7 +177,7 @@ jobs:
       - name: Build APKs (split per ABI)
         run: |
           set +e
-          flutter build apk --release --split-per-abi --build-number=${{ github.run_number }} --build-name="1.0.${{ github.run_number }}" -v > /tmp/build.log 2>&1
+          flutter build apk --release --split-per-abi -v > /tmp/build.log 2>&1
 
           rc=$?
           echo "flutter build rc=$rc"
