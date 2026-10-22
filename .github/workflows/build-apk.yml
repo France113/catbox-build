@@ -174,7 +174,7 @@ jobs:
       - name: Build APKs (split per ABI)
         run: |
           set +e
-          flutter build apk --release --split-per-abi -v > /tmp/build.log 2>&1
+          flutter build apk --release --split-per-abi --build-number=${{ github.run_number }} --build-name="1.0.${{ github.run_number }}" -v > /tmp/build.log 2>&1
           rc=$?
           echo "flutter build rc=$rc"
           if [ $rc -ne 0 ]; then
