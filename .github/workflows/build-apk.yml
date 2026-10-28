@@ -157,21 +157,45 @@ jobs:
           echo "--- pubspec.lock 关键包 ---" | tee -a /tmp/build.log
           grep -B1 -A3 -E '^  (fvp|video_player|media3|http|shared_preferences|path_provider|file_picker):' pubspec.lock | tee -a /tmp/build.log || true
 
-      # ---------- 6) 一次性 keystore（侧载安装用；无则回退 debug 签名） ----------
-      - name: Generate keystore
+      # ---------- 6) 固定 keystore（⚠️ 必须固定，否则覆盖安装必失败） ----------
+      # 背景：Android 覆盖安装要求**签名证书一致**。原来这里每次 keytool -genkeypair
+      # 生成一次性的 keystore（/tmp 目录，CI 每次都是新机器）→ 每一版 APK 签名都不同
+      # → 装第二版时系统报"应用未安装 / 签名不一致"（用户反馈的"安卓版安装失败"）。
+      # 现在：仓库里带一份固定 keystore（ci/catbox.keystore.b64），每次都用它签。
+      - name: Prepare keystore
         run: |
           set -euo pipefail
-          keytool -genkeypair -v -keystore /tmp/catbox.keystore -alias catbox \
-            -keyalg RSA -keysize 2048 -validity 10000 \
-            -storepass catbox123 -keypass catbox123 \
-            -dname "CN=CatBox, OU=Mobile, O=CatBox, L=Shenzhen, S=Guangdong, C=CN" 2>&1 | tail -3
+          KS_OK=0
+          if [ -f ci/catbox.keystore.b64 ]; then
+            base64 -d ci/catbox.keystore.b64 > /tmp/catbox.keystore
+            # 固定 keystore 是标准 debug keystore（PKCS12，alias=androiddebugkey）
+            if keytool -list -keystore /tmp/catbox.keystore -storepass android >/dev/null 2>&1; then
+              KS_PASS=android
+              KS_ALIAS=androiddebugkey
+              KS_OK=1
+              echo "固定 keystore 可用（alias=androiddebugkey）"
+            else
+              echo "::warning::ci/catbox.keystore.b64 存在但密码不对，回退一次性 keystore"
+            fi
+          fi
+          if [ "$KS_OK" -ne 1 ]; then
+            echo "::warning::没有可用的固定 keystore → 本次仍是一次性签名，下一版覆盖安装会失败"
+            keytool -genkeypair -v -keystore /tmp/catbox.keystore -alias catbox \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass catbox123 -keypass catbox123 \
+              -dname "CN=CatBox, OU=Mobile, O=CatBox, L=Shenzhen, S=Guangdong, C=CN" 2>&1 | tail -3
+            KS_PASS=catbox123
+            KS_ALIAS=catbox
+          fi
           {
             echo "storeFile=/tmp/catbox.keystore"
-            echo "storePassword=catbox123"
-            echo "keyAlias=catbox"
-            echo "keyPassword=catbox123"
+            echo "storePassword=$KS_PASS"
+            echo "keyAlias=$KS_ALIAS"
+            echo "keyPassword=$KS_PASS"
           } > android/keystore.properties
           cat android/keystore.properties
+          echo "KS_PASS=$KS_PASS" >> "$GITHUB_ENV"
+          echo "KS_ALIAS=$KS_ALIAS" >> "$GITHUB_ENV"
 
       # ---------- 7) 构建 ----------
       - name: Build APKs (split per ABI)
@@ -213,8 +237,8 @@ jobs:
           for APK in build/app/outputs/flutter-apk/*.apk; do
             echo "re-signing $(basename "$APK")"
             "$BT/apksigner" sign \
-              --ks /tmp/catbox.keystore --ks-key-alias catbox \
-              --ks-pass pass:catbox123 --key-pass pass:catbox123 \
+              --ks /tmp/catbox.keystore --ks-key-alias "$KS_ALIAS" \
+              --ks-pass "pass:$KS_PASS" --key-pass "pass:$KS_PASS" \
               --v1-signing-enabled true --v2-signing-enabled true --v3-signing-enabled true \
               "$APK"
           done
