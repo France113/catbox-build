@@ -1,0 +1,29 @@
+name: analyze-catbox
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: France113/catbox-flutter
+          token: ${{ secrets.PAT_PRIVATE }}
+          persist-credentials: false
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.13.5'
+          channel: stable
+
+      - name: Analyze
+        run: |
+          flutter pub get || true
+          flutter analyze --no-fatal-infos 2>&1 | tail -120
+          echo "=== ANALYZE_EXIT=$? ==="
