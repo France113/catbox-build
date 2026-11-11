@@ -34,6 +34,26 @@ jobs:
           accept-android-sdk-licenses: true
           log-accepted-android-sdk-licenses: true
 
+      # ⚠️ 必须**全量**接受 SDK license：
+      #    setup-android 的 accept-android-sdk-licenses 只接受 `packages` 里显式列出
+      #    那几个包的许可。而 AGP 8.11.1（Flutter 3.47.9 的硬性下限）在构建时会按需
+      #    自动下载 android-googletv-license / google-gdk-license 等额外组件，
+      #    这些 license 没接受 → Gradle 卡在交互式提示
+      #    "7 of 8 SDK package licenses not accepted. Review licenses (y/N)?" → 构建失败。
+      #    这一步把所有许可一次性接受，之后 AGP 自动下载组件就不会再卡。
+      - name: Accept all Android SDK licenses
+        run: |
+          set +e
+          SDKMANAGER="$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -1)"
+          if [ -z "$SDKMANAGER" ]; then
+            echo "::warning::sdkmanager not found, skip license acceptance"
+            exit 0
+          fi
+          echo "sdkmanager: $SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses > /tmp/sdk-licenses.log 2>&1
+          echo "licenses accepted (rc=$?)"
+          tail -3 /tmp/sdk-licenses.log
+
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
