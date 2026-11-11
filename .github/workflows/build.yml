@@ -154,6 +154,10 @@ jobs:
           if [ $rc -ne 0 ]; then
             echo "===== 关键错误 ====="
             grep -nE "error:|Undefined symbol|framework not found|PhaseScriptExecution failed" /tmp/build.log | tail -20
+            echo "===== 全部 Dart 编译错误（不截断）====="
+            grep -nE "\.dart:[0-9]+:[0-9]+: Error:" /tmp/build.log | sed 's/^/| /' | head -80
+            echo "===== 错误上下文（含 3 行前后）====="
+            grep -nE -B3 -A3 "\.dart:[0-9]+:[0-9]+: Error:" /tmp/build.log | grep -vE "^\s*$" | head -160
             echo "===== 失败脚本上下文（前 150 行）====="
             LN=$(grep -n "PhaseScriptExecution failed" /tmp/build.log | head -1 | cut -d: -f1)
             if [ -n "${LN:-}" ]; then
