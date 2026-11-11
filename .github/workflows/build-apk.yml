@@ -126,7 +126,15 @@ jobs:
           cp android/app/src/main/AndroidManifest.xml /tmp/keep/AndroidManifest.xml
           cp android/app/build.gradle       /tmp/keep/app-build.gradle
           cp android/app/proguard-rules.pro /tmp/keep/proguard-rules.pro
-          # 模板带来：settings.gradle(.kts) + 根 build.gradle + gradle.properties + wrapper(jar/脚本)
+          # ⚠️ settings.gradle / 根 build.gradle 也必须是**我们的版本**：
+          #    它们 include 了 OrangePlayer 的 7 个本地源码模块
+          #    （:palyerlibrary / :gsyVideoPlayer-* / :orange-*）。
+          #    早期这里只保留了 app/ 下的文件，rsync 用模板把 settings.gradle
+          #    覆盖回默认内容 → Gradle 报
+          #    "Project with path ':palyerlibrary' could not be found in project ':app'"
+          cp android/settings.gradle /tmp/keep/settings.gradle
+          cp android/build.gradle    /tmp/keep/build.gradle
+          # 模板带来：gradle.properties + wrapper(jar/脚本)
           rsync -a /tmp/host/android/ android/
           # 只保留模板生成的那种 DSL，删掉仓库里的另一种，避免歧义
           if [ -f android/settings.gradle.kts ]; then rm -f android/settings.gradle; fi
@@ -139,6 +147,13 @@ jobs:
           cp /tmp/keep/AndroidManifest.xml android/app/src/main/AndroidManifest.xml
           cp /tmp/keep/app-build.gradle     android/app/build.gradle
           cp /tmp/keep/proguard-rules.pro   android/app/proguard-rules.pro
+          # 恢复我们的 settings.gradle / 根 build.gradle（含 OrangePlayer 模块 include）
+          cp /tmp/keep/settings.gradle      android/settings.gradle
+          cp /tmp/keep/build.gradle         android/build.gradle
+          # orange-player/ 源码目录不会被 rsync 删掉（rsync 没加 --delete），
+          # 这里只做存在性断言，避免以后有人加 --delete 时静默丢失。
+          test -d android/orange-player/palyerlibrary || {
+            echo "::error::android/orange-player 缺失（播放器源码没被检出？）"; exit 1; }
           # app 目录只保留我们的 Groovy build.gradle，删掉模板的 .kts（否则 Gradle 报警告）
           rm -f android/app/build.gradle.kts
           echo "--- android/ ---"; ls android android/app
