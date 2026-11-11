@@ -137,23 +137,50 @@ jobs:
       - name: Copy libc++_shared.so (from NDK)
         run: |
           set -euo pipefail
-          SYSROOT="$ANDROID_HOME/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib"
+          NDK="$ANDROID_HOME/ndk/28.2.13676358"
+          PRE="$NDK/toolchains/llvm/prebuilt/linux-x86_64"
+          SYSROOT="$PRE/sysroot"
+          READELF="$PRE/bin/llvm-readelf"
+          STRIP="$PRE/bin/llvm-strip"
+          [ -x "$READELF" ] || { echo "::error::llvm-readelf 不存在：$READELF"; exit 1; }
+          # ⚠️ **不要猜 NDK 目录名**：不同 NDK 版本的 32 位 ARM triple 目录名不一样
+          #    （armv7a-linux-androideabi / arm-linux-androideabi …），
+          #    猜错就"找不到文件"（2026-11-12 run#143 就这么失败的）。
+          #    正确做法：遍历 sysroot 下所有 libc++_shared.so，按 **ELF 机器类型**挑。
+          #    按路径深度排序（浅的在前）= 官方那份"当前 API 版本"。
+          mapfile -t CAND < <(find "$SYSROOT" -name 'libc++_shared.so' -printf '%d %p\n' 2>/dev/null | sort -n | cut -d' ' -f2-)
+          echo "NDK 内 libc++_shared.so 候选 ${#CAND[@]} 个"
+          for f in "${CAND[@]}"; do echo "   $f"; done
+          pick() {
+            local want="$1" f m
+            for f in "${CAND[@]}"; do
+              m=$("$READELF" -h "$f" 2>/dev/null | sed -n 's/^ *Machine: *//p' | head -1)
+              case "$m" in *"$want"*) printf '%s' "$f"; return 0 ;; esac
+            done
+            return 1
+          }
           for ABI in arm64-v8a armeabi-v7a x86_64; do
             case "$ABI" in
-              arm64-v8a)   T=aarch64-linux-android ;;
-              armeabi-v7a) T=armv7a-linux-androideabi ;;
-              x86_64)      T=x86_64-linux-android ;;
-              *) echo "::error::未知 ABI $ABI"; exit 1 ;;
+              arm64-v8a)   want="AArch64" ;;
+              armeabi-v7a) want="ARM" ;;
+              x86_64)      want="X86-64" ;;
             esac
-            # NDK 里 libc++_shared.so 按 API 级别分目录（21/24/26/28/.../36），取最高的
-            SRC=$(find "$SYSROOT/$T" -name 'libc++_shared.so' 2>/dev/null | sort -V | tail -1)
+            SRC=$(pick "$want" || true)
             if [ -z "$SRC" ]; then
-              echo "::error::NDK 里找不到 $T/libc++_shared.so（缺它 → 装上就闪退）"
-              exit 1
+              if [ "$ABI" = "arm64-v8a" ]; then
+                echo "::error::NDK 里找不到 arm64-v8a 的 libc++_shared.so（缺它 → 装上就闪退）"
+                exit 1
+              fi
+              echo "::warning::NDK 里没有 $ABI 的 libc++_shared.so —— 该 ABI 不出包，"
+              echo "::warning::同时清掉它的 libnode.so（避免半套 native 依赖）"
+              rm -f "android/app/src/main/jniLibs/$ABI/libnode.so"
+              continue
             fi
             DST="android/app/src/main/jniLibs/$ABI"
             mkdir -p "$DST"
             cp "$SRC" "$DST/libc++_shared.so"
+            # 官方那份是 9MB 带符号的，strip 后 ~1.3MB（老 APK 里的就是 1.25MB）
+            "$STRIP" --strip-unneeded "$DST/libc++_shared.so"
             echo "$ABI: $(stat -c%s "$DST/libc++_shared.so") bytes  <- $SRC"
           done
 
