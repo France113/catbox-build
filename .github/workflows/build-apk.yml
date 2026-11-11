@@ -30,7 +30,12 @@ jobs:
         uses: android-actions/setup-android@v3
         with:
           # 注意：单行空格分隔，不能用 YAML 多行块（整块会被当成一个包名）
-          packages: 'platforms;android-36 build-tools;36.0.0 ndk;28.2.13676358 cmake;3.22.1'
+          # ndk 装**两个**：
+          #   28.2.13676358 —— app（fvp/libmdk 要求）
+          #   27.0.12077973 —— fvp 插件自己声明的 ndkVersion
+          #   （AGP 8.11 对 NDK 版本校验更严，缺了会报
+          #    "Failed to install the following SDK components: ndk;27.0.12077973"）
+          packages: 'platforms;android-36 build-tools;36.0.0 ndk;28.2.13676358 ndk;27.0.12077973 cmake;3.22.1'
           accept-android-sdk-licenses: true
           log-accepted-android-sdk-licenses: true
 
