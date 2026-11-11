@@ -158,6 +158,11 @@ jobs:
           rm -f android/app/build.gradle.kts
           echo "--- android/ ---"; ls android android/app
           echo "--- settings ---"; cat android/settings.gradle* 2>/dev/null
+          # AGP 版本自检：Flutter SDK 对 AGP 有硬性下限（3.47.9 要求 >= 8.11.1）。
+          # 把模板自带的版本和我们的版本并排打出来，出问题一眼定位。
+          echo "--- AGP 版本对比 ---"
+          echo -n "  模板:   "; grep -o 'com.android.application\" version \"[0-9.]*' /tmp/host/android/settings.gradle 2>/dev/null | head -1 || echo '(无)'
+          echo -n "  我们的: "; grep -o 'com.android.application\" version \"[0-9.]*' android/settings.gradle 2>/dev/null | head -1 || echo '(无)'
           echo "--- wrapper ---"; ls android/gradle/wrapper/ android/gradlew
 
       # ---------- 5) 依赖解析 ----------
