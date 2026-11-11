@@ -120,6 +120,43 @@ jobs:
             echo "$ABI: $(stat -c%s "$DST/libnode.so") bytes"
           done
 
+      # ---------- 2.5) libc++_shared.so（libnode.so 的运行时依赖，必须！） ----------
+      # ⚠️ 这是 2026-11-12「一打开 App 就闪退、且没有任何提示」的**根因**：
+      #
+      #   libnode.so（nodejs-mobile v18.20.4 预编译）的 DT_NEEDED 里写着 libc++_shared.so
+      #   （实测：libnode.so NEEDED = libm, libdl, liblog, libc++_shared, libc）
+      #   而这个 .so 以前是 **fvp(libmdk) 顺带打进 APK 的**（老 APK 里确实有
+      #   lib/arm64-v8a/libc++_shared.so，1.25MB）。
+      #   2026-11-12 删掉 fvp（省 10MB）后，就没人提供它了 →
+      #     System.loadLibrary("node") → dlopen failed: library "libc++_shared.so" not found
+      #     → UnsatisfiedLinkError → 静态初始化里抛 → 进程当场死 → **无声闪退**。
+      #
+      #   修法：从 NDK 里把 libc++_shared.so 复制到 jniLibs/<abi>/（NDK r27+ 自带 16KB 对齐版本）。
+      #   ⚠️ 不要用 `arguments "-DANDROID_STL=c++_shared"` —— AGP 8.11 的 CmakeOptions
+      #      已经没有 arguments() 方法了，会报 "Could not find method arguments()"。
+      - name: Copy libc++_shared.so (from NDK)
+        run: |
+          set -euo pipefail
+          SYSROOT="$ANDROID_HOME/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib"
+          for ABI in arm64-v8a armeabi-v7a x86_64; do
+            case "$ABI" in
+              arm64-v8a)   T=aarch64-linux-android ;;
+              armeabi-v7a) T=armv7a-linux-androideabi ;;
+              x86_64)      T=x86_64-linux-android ;;
+              *) echo "::error::未知 ABI $ABI"; exit 1 ;;
+            esac
+            # NDK 里 libc++_shared.so 按 API 级别分目录（21/24/26/28/.../36），取最高的
+            SRC=$(find "$SYSROOT/$T" -name 'libc++_shared.so' 2>/dev/null | sort -V | tail -1)
+            if [ -z "$SRC" ]; then
+              echo "::error::NDK 里找不到 $T/libc++_shared.so（缺它 → 装上就闪退）"
+              exit 1
+            fi
+            DST="android/app/src/main/jniLibs/$ABI"
+            mkdir -p "$DST"
+            cp "$SRC" "$DST/libc++_shared.so"
+            echo "$ABI: $(stat -c%s "$DST/libc++_shared.so") bytes  <- $SRC"
+          done
+
       # ---------- 3) strip 瘦身 + 16KB 页重对齐（Android 15+） ----------
       - name: Strip + 16KB page-align libnode.so
         run: |
@@ -137,6 +174,9 @@ jobs:
             echo "::error::16KB 重对齐失败"; exit 1; }
           python3 scripts/check_elf_16k.py android/app/src/main/jniLibs/*/libnode.so || {
             echo "::error::16KB 校验失败"; exit 1; }
+          # libc++_shared.so：NDK r27+ 自带 16KB 对齐，只做校验不做重排（避免动坏 NDK 官方库）
+          python3 scripts/check_elf_16k.py android/app/src/main/jniLibs/*/libc++_shared.so \
+            || echo "::warning::libc++_shared.so 非 16KB 对齐（useLegacyPackaging=true 走解压安装，影响很小）"
 
       # ---------- 4) 用官方模板补齐 Android 宿主（gradlew / wrapper jar / 官方 settings） ----------
       - name: Assemble Android host
@@ -308,6 +348,24 @@ jobs:
               echo "v1 signature: PRESENT"
             else
               echo "::error::v1(JAR) 签名缺失 —— Android 5.x/6.x 将无法安装"
+              exit 1
+            fi
+            # ⚠️ libc++_shared.so 必须存在：libnode.so 依赖它，缺了装上就闪退。
+            #    （2026-11-12 用户反馈"打开即闪退"的根因，务必别删掉这个断言。）
+            #    按 APK 里**实际出现的 ABI 目录**逐个校验（arm64 单包时只校验 arm64-v8a）。
+            APK_ABIS=$(unzip -l "$APK" | awk '/lib\/[a-z0-9_-]+\/.*\.so$/ {split($4,a,"/"); print a[2]}' | sort -u)
+            echo "APK 内 ABI: $(echo $APK_ABIS | tr '\n' ' ')"
+            for ABI in $APK_ABIS; do
+              if unzip -l "$APK" | grep -q "lib/$ABI/libc++_shared.so"; then
+                echo "libc++_shared.so ($ABI): PRESENT"
+              else
+                echo "::error::APK 缺少 lib/$ABI/libc++_shared.so —— 装上会 UnsatisfiedLinkError 闪退"
+                exit 1
+              fi
+            done
+            # libnode.so 也必须在（没有它源站引擎跑不起来）
+            if ! unzip -l "$APK" | grep -q "lib/.*/libnode.so"; then
+              echo "::error::APK 缺少 libnode.so"
               exit 1
             fi
             "$BT/zipalign" -c -v 4 "$APK" 2>&1 | tail -2
