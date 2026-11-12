@@ -62,7 +62,15 @@ jobs:
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
-          channel: stable
+          # ⚠️ **必须固定版本**（2026-11-12 实测踩坑）：
+          #   原来写 `channel: stable` → 每次构建都跟着 Flutter stable 走。
+          #   2026-11-12 stable 从 3.47.9 升到 3.50.0，Flutter 的 AGP 下限随之
+          #   从 8.11.1 抬到 9.1.1，而我们 settings.gradle 固定的是 8.11.1 →
+          #   构建直接失败：
+          #     "Your project's Android Gradle Plugin version (8.11.1) is lower than
+          #      Flutter's minimum supported version of Android Gradle Plugin version 9.1.1"
+          #   锁 3.47.9（= run#146 验证过能出包的那版）保证构建**可复现**。
+          flutter-version: '3.47.9'
           cache: true
 
       - name: Setup Node
