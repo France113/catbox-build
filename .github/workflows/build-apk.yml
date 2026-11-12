@@ -201,7 +201,11 @@ jobs:
             echo "::error::16KB 重对齐失败"; exit 1; }
           python3 scripts/check_elf_16k.py android/app/src/main/jniLibs/*/libnode.so || {
             echo "::error::16KB 校验失败"; exit 1; }
-          # libc++_shared.so：NDK r27+ 自带 16KB 对齐，只做校验不做重排（避免动坏 NDK 官方库）
+          # libc++_shared.so：NDK 里 **x86_64 那份是 4KB 对齐**（arm64/v7a 是 16KB），
+          #   所以统一用脚本重排一次（脚本幂等，已对齐的原样写出）。
+          #   我们只出 arm64-v8a，但顺手把三个 ABI 都弄合规，以后要出别的架构也不用改。
+          python3 scripts/align_elf_16k.py android/app/src/main/jniLibs/*/libc++_shared.so || {
+            echo "::error::libc++_shared.so 16KB 重排失败"; exit 1; }
           python3 scripts/check_elf_16k.py android/app/src/main/jniLibs/*/libc++_shared.so || {
             echo "::error::libc++_shared.so 非 16KB 对齐 —— 16KB 页设备上会加载失败"; exit 1; }
 
