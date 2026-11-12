@@ -202,8 +202,8 @@ jobs:
           python3 scripts/check_elf_16k.py android/app/src/main/jniLibs/*/libnode.so || {
             echo "::error::16KB 校验失败"; exit 1; }
           # libc++_shared.so：NDK r27+ 自带 16KB 对齐，只做校验不做重排（避免动坏 NDK 官方库）
-          python3 scripts/check_elf_16k.py android/app/src/main/jniLibs/*/libc++_shared.so \
-            || echo "::warning::libc++_shared.so 非 16KB 对齐（useLegacyPackaging=true 走解压安装，影响很小）"
+          python3 scripts/check_elf_16k.py android/app/src/main/jniLibs/*/libc++_shared.so || {
+            echo "::error::libc++_shared.so 非 16KB 对齐 —— 16KB 页设备上会加载失败"; exit 1; }
 
       # ---------- 4) 用官方模板补齐 Android 宿主（gradlew / wrapper jar / 官方 settings） ----------
       - name: Assemble Android host
@@ -401,8 +401,14 @@ jobs:
             unzip -qo "$APK" 'lib/*' -d /tmp/verify
             echo "--- .so 清单（APK 内偏移 / 大小）---"
             unzip -v "$APK" | grep -E "\.so$" || true
-            python3 scripts/check_elf_16k.py $(find /tmp/verify/lib -name '*.so' | sort) \
-              || echo "::warning::$APK 存在非 16KB 对齐 .so（Android <=14 不受影响，Android 15+ 16KB 页设备装不了）"
+            # ⚠️ **硬失败**（2026-11-12 起）：Android 15+ 是 16KB 页设备，
+            #    Android 16 更是全量 16KB；任何没对齐的 .so 一旦被 dlopen 就会失败。
+            #    之前这里是 warning → 带着 librtmp-jni.so（p_align=4096）发了几个版本。
+            if ! python3 scripts/check_elf_16k.py $(find /tmp/verify/lib -name '*.so' | sort); then
+              echo "::error::$APK 存在非 16KB 对齐的 .so —— 16KB 页设备（Android 15/16）上会加载失败"
+              exit 1
+            fi
+            echo "16KB 对齐检查：全部通过 ✅"
           done
 
       # ---------- 9) 交付物 ----------
